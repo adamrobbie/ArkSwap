@@ -10,9 +10,11 @@ import { ScoreService } from './stats/score.service';
 import { StatsController } from './stats/stats.controller';
 import { DebugController } from './debug/debug.controller';
 
+import { WatchController } from './watch.controller';
+
 @Module({
   imports: [DatabaseModule, ScheduleModule.forRoot()],
-  controllers: [StatsController, DebugController],
+  controllers: [StatsController, DebugController, WatchController],
   providers: [
     BitcoinService,
     ScannerService,
@@ -22,4 +24,4 @@ import { DebugController } from './debug/debug.controller';
     ScoreService,
   ],
 })
-export class AppModule {}
+export class AppModule { }
