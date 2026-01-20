@@ -17,7 +17,7 @@ export class ParserService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly bitcoinService: BitcoinService,
-  ) {}
+  ) { }
 
   /**
    * Checks if an output contains the OP_RETURN marker for Ark rounds.
@@ -99,12 +99,18 @@ export class ParserService {
       `[Parser] Parsing block ${blockHeight} with ${blockData.tx.length} transactions`,
     );
 
+    // Fetch ASP Pool address to detect exits
+    const asp = await this.prisma.aspDefinition.findFirst({
+      where: { id: 'local-asp' },
+    });
+    const poolAddress = asp?.poolAddress;
+    this.logger.log(`[Parser] Current Pool Address: ${poolAddress || 'NOT FOUND'}`);
+
     for (const tx of blockData.tx) {
       this.logger.debug(`[Parser] Checking Tx: ${tx.txid}`);
 
       // Check outputs for OP_RETURN marker
       let foundMarker = false;
-
       for (const vout of tx.vout) {
         if (this.hasArkMarker(vout)) {
           foundMarker = true;
@@ -112,52 +118,141 @@ export class ParserService {
         }
       }
 
-      if (!foundMarker) {
-        continue;
-      }
-
-      this.logger.log(
-        `🚨 MATCH FOUND! Ark Round Detected via Marker: ${tx.txid}`,
-      );
-
-      const { inputAmount, outputAmount, vtxoCount } =
-        ParserService.calculateAmounts(tx);
-
-      // Calculate tree depth from vtxoCount
-      // Tree depth is approximately log2(vtxoCount) for a balanced tree
-      const treeDepth = vtxoCount > 0 ? Math.ceil(Math.log2(vtxoCount)) : 0;
-
-      // Use 'local-asp' as default aspId since we found the marker
-      // In the future, this could be looked up from a registry or database
-      const aspId = 'local-asp';
-
-      const data: Prisma.ArkRoundUncheckedCreateInput = {
-        txid: tx.txid,
-        aspId,
-        blockHeight,
-        timestamp: blockTimestamp,
-        inputAmount,
-        outputAmount,
-        vtxoCount,
-        treeDepth,
-      };
-
-      // Idempotent: upsert by txid so re-scans do not fail.
-      try {
-        await this.prisma.arkRound.upsert({
-          where: { txid: tx.txid },
-          update: data,
-          create: data,
-        });
-
+      if (foundMarker) {
         this.logger.log(
-          `[Parser] ✅ Indexed ArkRound tx=${tx.txid} aspId=${aspId} height=${blockHeight}`,
+          `🚨 MATCH FOUND! Ark Round Detected via Marker: ${tx.txid}`,
         );
-      } catch (error) {
-        this.logger.error(
-          `[Parser] ❌ Failed to insert ArkRound for tx=${tx.txid}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        throw error;
+
+        const { inputAmount, outputAmount, vtxoCount } =
+          ParserService.calculateAmounts(tx);
+
+        // Calculate tree depth from vtxoCount
+        const treeDepth = vtxoCount > 0 ? Math.ceil(Math.log2(vtxoCount)) : 0;
+        const aspId = 'local-asp';
+
+        const data: Prisma.ArkRoundUncheckedCreateInput = {
+          txid: tx.txid,
+          aspId,
+          blockHeight,
+          timestamp: blockTimestamp,
+          inputAmount,
+          outputAmount,
+          vtxoCount,
+          treeDepth,
+        };
+
+        try {
+          // 1. Upsert Round
+          await this.prisma.arkRound.upsert({
+            where: { txid: tx.txid },
+            update: data,
+            create: data,
+          });
+
+          // 2. Also record as a ROUND type transaction for consistency in ArkTransaction table
+          await this.prisma.arkTransaction.upsert({
+            where: { txid: tx.txid },
+            update: {
+              amount: outputAmount,
+              timestamp: blockTimestamp,
+              type: 'ROUND',
+            },
+            create: {
+              txid: tx.txid,
+              aspId,
+              blockHeight,
+              timestamp: blockTimestamp,
+              amount: outputAmount,
+              type: 'ROUND',
+            },
+          });
+
+          this.logger.log(
+            `[Parser] ✅ Indexed ArkRound tx=${tx.txid} aspId=${aspId} height=${blockHeight}`,
+          );
+        } catch (error) {
+          this.logger.error(
+            `[Parser] ❌ Failed to insert ArkRound for tx=${tx.txid}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          throw error;
+        }
+      } else {
+        // Not an Ark Round, check if it's a Unilateral Exit
+        // Definition: Spends from a previous ArkRound anchor BUT is not an ArkRound itself.
+        let exitAmount = 0n;
+        const toSats = (value: number | undefined): bigint => {
+          if (typeof value !== 'number') return 0n;
+          return BigInt(Math.round(value * 1e8));
+        };
+
+        for (const vin of tx.vin) {
+          if (!vin.txid || typeof vin.vout !== 'number') continue;
+
+          try {
+            // Check if this input spends an output from a known ArkRound
+            const sourceRound = await this.prisma.arkRound.findUnique({
+              where: { txid: vin.txid },
+            });
+
+            if (sourceRound) {
+              // Get the actual value spent from the raw transaction
+              // We need this because we don't store individual outputs in our DB yet.
+              const prevTx = await this.bitcoinService.getRawTransaction(vin.txid);
+              const prevOut = prevTx.vout[vin.vout];
+
+              // Skip if it's spending the OP_RETURN marker (shouldn't happen but good practice)
+              if (prevOut?.scriptPubKey?.type === 'nulldata') continue;
+
+              exitAmount += toSats(prevOut.value);
+
+              this.logger.warn(
+                `[Parser] 🕵️ EXIT LINKED! Spends from ArkRound ${vin.txid}:${vin.vout} -> amount=${prevOut.value}`,
+              );
+            } else if (poolAddress) {
+              // Fallback: Check if it's spending from the known poolAddress directly
+              const prevTx = await this.bitcoinService.getRawTransaction(vin.txid);
+              const prevOut = prevTx.vout[vin.vout];
+
+              if (prevOut?.scriptPubKey?.address === poolAddress) {
+                exitAmount += toSats(prevOut.value);
+                this.logger.warn(
+                  `[Parser] 🕵️ EXIT ADDR MATCH! Spends from poolAddress in tx=${tx.txid}, amount=${prevOut.value}`,
+                );
+              }
+            }
+          } catch (error) {
+            this.logger.debug(
+              `[Parser] Optional resolution failed for ${vin.txid}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+
+        if (exitAmount > 0n) {
+          this.logger.error(
+            `🚨 UNILATERAL EXIT DETECTED! ${exitAmount} sats taken from pool in tx: ${tx.txid}`,
+          );
+
+          try {
+            await this.prisma.arkTransaction.upsert({
+              where: { txid: tx.txid },
+              update: {
+                amount: exitAmount,
+                timestamp: blockTimestamp,
+                type: 'UNILATERAL_EXIT',
+              },
+              create: {
+                txid: tx.txid,
+                aspId: 'local-asp',
+                blockHeight,
+                timestamp: blockTimestamp,
+                amount: exitAmount,
+                type: 'UNILATERAL_EXIT',
+              },
+            });
+          } catch (error) {
+            this.logger.error(`[Parser] ❌ Failed to insert Exit tx=${tx.txid}`);
+          }
+        }
       }
     }
   }

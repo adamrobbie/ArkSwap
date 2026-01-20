@@ -1,8 +1,9 @@
-FROM node:18-alpine
+FROM node:18-slim
 
-# Install pnpm and curl (for healthcheck)
+# Install pnpm and curl (for healthcheck) and openssl for Prisma
 RUN npm install -g pnpm@10.22.0 && \
-    apk add --no-cache curl
+    apt-get update -y && \
+    apt-get install -y curl openssl
 
 # Set working directory
 WORKDIR /app

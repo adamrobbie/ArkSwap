@@ -12,10 +12,11 @@ services:
       - -rpcbind=0.0.0.0
       - -rpcallowip=0.0.0.0/0
       - -fallbackfee=0.0002
+      - -wallet=ark
     ports:
       - "18443:18443"
     volumes:
-      - ./data/bitcoin:/root/.bitcoin
+      - bitcoin_data:/home/bitcoin/.bitcoin
     networks:
       - arkswap-network
     healthcheck:
@@ -34,7 +35,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     networks:
       - arkswap-network
     healthcheck:
@@ -87,7 +88,8 @@ services:
       - "3002:3002"
     environment:
       - BITCOIN_RPC_URL=http://bitcoind:18443
-      - DATABASE_URL=postgresql://arkswap:arkswap@postgres:5432/arkswap
+      - DATABASE_URL=postgresql://arkswap:arkswap@postgres:5432/arkswap?schema=public
+      - ASP_API_URL=http://asp:7070
     networks:
       - arkswap-network
     depends_on:
@@ -104,4 +106,8 @@ services:
 networks:
   arkswap-network:
     driver: bridge
+
+volumes:
+  bitcoin_data:
+  postgres_data:
 
