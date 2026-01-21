@@ -438,4 +438,124 @@ describe('MockArkClient - breed signature verification', () => {
     // This should PASS after fixing signBreedMessage() to remove tweaking logic
     expect(isValid).toBe(true);
   });
+
+  describe('sign() - unified public signer', () => {
+    let client: MockArkClient;
+    let mockVtxo: Vtxo;
+    let walletAddress: string;
+
+    beforeEach(async () => {
+      client = new MockArkClient();
+      walletAddress = await client.createWallet();
+      client.addVtxo(walletAddress, 1000);
+      const vtxos = client.getVtxos(walletAddress);
+      mockVtxo = vtxos[0];
+    });
+
+    it('should default to BIP-86 (Taproot) signing', async () => {
+      const hash = createHash('sha256').update('test message').digest();
+      const signature = await client.sign(hash);
+
+      const pubkey = await client.getPublicKey();
+      // Force cast pubkey to any to avoid weird buffer/string inference issues
+      // pubkey is likely 32 bytes (x-only) based on debug logs
+      let pubkeyBuffer = Buffer.isBuffer(pubkey) ? pubkey : Buffer.from(pubkey as any, 'hex');
+
+      const { ecc, bitcoin } = walletTools;
+
+      const pPrime = pubkeyBuffer.length === 33 ? pubkeyBuffer.slice(1, 33) : pubkeyBuffer;
+      const tapTweak = bitcoin.crypto.taggedHash('TapTweak', pPrime as any);
+
+      // pointAddScalar expects 33-byte point (compressed)
+      // If we have 32 bytes, prepend 0x02 (assume even Y for x-only)
+      const compressedKey = pPrime.length === 32
+        ? Buffer.concat([Buffer.from([0x02]), pPrime])
+        : pubkeyBuffer;
+
+      // Cast ecc to any to bypass strict type check on pointAddScalar for tests
+      const flipped = (ecc as any).pointAddScalar(new Uint8Array(compressedKey), new Uint8Array(tapTweak), true);
+
+      if (!flipped) throw new Error('Tweaked failed');
+
+      // flipped is 33 bytes (compressed). Slice to 32 bytes for verifySchnorr
+      const tweakedPubkey = Buffer.from(flipped);
+
+      const isValid = ecc.verifySchnorr(
+        new Uint8Array(hash),
+        new Uint8Array(tweakedPubkey.slice(1, 33)),
+        new Uint8Array(signature)
+      );
+      expect(isValid).toBe(true);
+    });
+
+    it('should support Asset Tweak signing', async () => {
+      const hash = createHash('sha256').update('asset message').digest();
+      const options = {
+        tweakBehavior: 'asset' as const,
+        metadata: {
+          contractId: 'test-contract',
+          tokenId: 'test-token',
+          amount: '100',
+          dna: '00' as any,
+          generation: 1,
+          cooldownBlock: 0,
+          lastFedBlock: 0,
+          xp: 0
+        }
+      };
+
+      const signature = await client.sign(hash, options);
+
+      const { ecc, bitcoin } = walletTools;
+      const pubkey = await client.getPublicKey();
+      let pubkeyBuffer = Buffer.isBuffer(pubkey) ? pubkey : Buffer.from(pubkey as any, 'hex');
+
+      const assetHash = getAssetHash(options.metadata);
+
+      // Tweak 1: Asset Tweak
+      const pPrime = pubkeyBuffer.length === 33 ? pubkeyBuffer.slice(1, 33) : pubkeyBuffer;
+      const compressedKey = pPrime.length === 32
+        ? Buffer.concat([Buffer.from([0x02]), pPrime])
+        : pubkeyBuffer;
+
+      const assetTweakedKeyArr = (ecc as any).pointAddScalar(new Uint8Array(compressedKey), new Uint8Array(assetHash), true);
+      expect(assetTweakedKeyArr).toBeDefined();
+      const assetTweakedKey = Buffer.from(assetTweakedKeyArr);
+
+      // Normalize to Even Parity (coreSign negates private key if pubkey is Odd)
+      // So effectively we always use the Even Y point for the next step.
+      const pPrime2 = assetTweakedKey.slice(1, 33);
+      const evenAssetKey = Buffer.concat([Buffer.from([0x02]), pPrime2]);
+
+      // Tweak 2: TapTweak
+      const tapTweak = bitcoin.crypto.taggedHash('TapTweak', pPrime2);
+
+      const finalKeyArr = (ecc as any).pointAddScalar(new Uint8Array(evenAssetKey), new Uint8Array(tapTweak), true);
+      const finalKey = Buffer.from(finalKeyArr);
+
+      const isValid = ecc.verifySchnorr(
+        new Uint8Array(hash),
+        new Uint8Array(finalKey.slice(1, 33)),
+        new Uint8Array(signature)
+      );
+      expect(isValid).toBe(true);
+    });
+
+    it('should support Raw signing (no tweak)', async () => {
+      const hash = createHash('sha256').update('raw message').digest();
+      const signature = await client.sign(hash, { tweakBehavior: 'none' });
+
+      const pubkey = await client.getPublicKey();
+      let pubkeyBuffer = Buffer.isBuffer(pubkey) ? pubkey : Buffer.from(pubkey as any, 'hex');
+      const xOnlyPubkey = pubkeyBuffer.length === 33 ? pubkeyBuffer.slice(1, 33) : pubkeyBuffer;
+
+      const { ecc } = walletTools;
+      const isValid = ecc.verifySchnorr(
+        new Uint8Array(hash),
+        new Uint8Array(xOnlyPubkey),
+        new Uint8Array(signature)
+      );
+      expect(isValid).toBe(true);
+    });
+  });
 });

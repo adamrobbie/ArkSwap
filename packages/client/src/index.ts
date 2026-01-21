@@ -28,6 +28,20 @@ const WIF_STORAGE_KEY = 'ark_wallet_wif';
 const VTXO_STORAGE_KEY = 'ark_vtxos';
 const WATCHED_ADDRESSES_KEY = 'ark_watched_addresses';
 
+export interface SignOptions {
+  /**
+   * Tweak behavior:
+   * - 'bip86': Standard Taproot tweak (default)
+   * - 'asset': Asset tweak + Taproot tweak (for Koi assets)
+   * - 'none': Raw key signing (for breeding messages)
+   */
+  tweakBehavior?: 'bip86' | 'asset' | 'none';
+  /**
+   * Metadata for asset tweaking (required if tweakBehavior is 'asset')
+   */
+  metadata?: AssetMetadata;
+}
+
 export class MockArkClient {
   /**
    * EMPTY CONSTRUCTOR - Do not load keys, do not access localStorage, do not call crypto.
@@ -172,58 +186,85 @@ export class MockArkClient {
   }
 
   /**
-   * Signs a hash (stub for Chunk 8)
+   * Options for signing
+  /**
+   * Signs a hash using the unified signing logic
+   * Supports BIP-86, Asset Tweaks, and Raw Signing
    */
-  async sign(hash: Buffer): Promise<Buffer> {
-    // TODO: Implement in Chunk 8
-    throw new Error('sign() not yet implemented');
+  async sign(hash: Buffer, options: SignOptions = {}): Promise<Buffer> {
+    const signatureHex = await this.coreSign(hash, options);
+    return Buffer.from(signatureHex, 'hex');
   }
 
   /**
-   * Private helper: Signs a hash using BIP-86 (Taproot) tweaked private key
-   * Returns the signature as a hex string
+   * Unified private signing helper
+   * Centralizes all Parity and Tweaking logic
    */
-  private async signSchnorr(hash: Buffer): Promise<string> {
-    const { bitcoin, ECPair, network } = walletTools;
+  private async coreSign(hash: Buffer, options: SignOptions): Promise<string> {
+    const { bitcoin, ECPair, ecc } = walletTools;
+    const tweakBehavior = options.tweakBehavior || 'bip86';
+
     const keyPair = await this.getKeyPair();
-
-    // --- BIP-86 SIGNING LOGIC START ---
-
-    // 1. Prepare the Private Key Buffer (32 bytes)
     if (!keyPair.privateKey) throw new Error('Missing private key');
+
+    // 1. Prepare Private Key Buffer (32 bytes)
     let privateKeyBuffer =
       keyPair.privateKey.length === 33
         ? keyPair.privateKey.slice(1)
         : keyPair.privateKey;
 
-    // 2. Handle Key Parity (Critical for Taproot)
-    // If the public key has an ODD Y-coordinate (prefix 0x03),
-    // we must negate the private key before tweaking to match the x-only pubkey expectation.
+    // 2. Handle Base Key Parity (Critical for Taproot)
     if (keyPair.publicKey[0] === 0x03) {
-      privateKeyBuffer = Buffer.from(
-        walletTools.ecc.privateNegate(privateKeyBuffer),
-      );
+      privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
     }
 
-    // 3. Get x-only Pubkey
-    const internalPubkey = keyPair.publicKey.slice(1, 33);
+    // 3. Apply Tweak Logic
+    if (tweakBehavior === 'asset') {
+      if (!options.metadata)
+        throw new Error('Asset metadata required for asset signing');
 
-    // 4. Calculate Tweak
-    const tweakHash = bitcoin.crypto.taggedHash('TapTweak', internalPubkey);
+      const assetTweak = getAssetHash(options.metadata);
+      const assetPrivateKey = ecc.privateAdd(privateKeyBuffer, assetTweak);
+      if (!assetPrivateKey) throw new Error('Asset tweak failed');
 
-    // 5. Apply Tweak
-    const tweakedPrivateKey = walletTools.ecc.privateAdd(
-      privateKeyBuffer,
-      tweakHash,
-    );
-    if (!tweakedPrivateKey) throw new Error('Failed to tweak private key');
+      privateKeyBuffer = Buffer.from(assetPrivateKey);
 
-    // --- BIP-86 SIGNING LOGIC END ---
+      // Handle Asset Pubkey Parity
+      const tempPair = ECPair.fromPrivateKey(privateKeyBuffer);
+      if (tempPair.publicKey[0] === 0x03) {
+        privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
+      }
 
-    // Sign using the TWEAKED private key
-    const signatureRaw = walletTools.ecc.signSchnorr(hash, tweakedPrivateKey);
+      // Continue to Taproot tweak (Assets are P2TR, so they use AssetKey as internal key)
+    }
+
+    if (tweakBehavior === 'bip86' || tweakBehavior === 'asset') {
+      // Get internal pubkey (P') from current private key state
+      const currentPair = ECPair.fromPrivateKey(privateKeyBuffer);
+      const pPrime = currentPair.publicKey.slice(1, 33);
+
+      // Calculate TapTweak
+      const tapTweak = bitcoin.crypto.taggedHash('TapTweak', pPrime);
+      const tweakedPrivateKey = ecc.privateAdd(privateKeyBuffer, tapTweak);
+      if (!tweakedPrivateKey) throw new Error('Taproot tweak failed');
+
+      privateKeyBuffer = Buffer.from(tweakedPrivateKey);
+    }
+
+    // 4. Sign
+    const signatureRaw = ecc.signSchnorr(hash, privateKeyBuffer);
     return Buffer.from(signatureRaw).toString('hex');
   }
+
+  /**
+   * Private helper: Signs a hash using BIP-86 (Taproot) tweaked private key
+   * Returns the signature as a hex string
+   * @deprecated Use coreSign with tweakBehavior: 'bip86'
+   */
+  private async signSchnorr(hash: Buffer): Promise<string> {
+    return this.coreSign(hash, { tweakBehavior: 'bip86' });
+  }
+
 
   /**
    * Mints a Gen 0 Koi asset
@@ -715,70 +756,11 @@ export class MockArkClient {
     vtxo: Vtxo & { metadata?: AssetMetadata; assetId?: string },
     txHashBuffer: Buffer,
   ): Promise<string> {
-    const { bitcoin, ECPair, ecc } = walletTools;
-    const keyPair = await this.getKeyPair();
+    const options: SignOptions = vtxo.metadata
+      ? { tweakBehavior: 'asset', metadata: vtxo.metadata }
+      : { tweakBehavior: 'bip86' };
 
-    if (!keyPair.privateKey) {
-      throw new Error('Missing private key');
-    }
-
-    // Prepare private key buffer (32 bytes)
-    let privateKeyBuffer =
-      keyPair.privateKey.length === 33
-        ? keyPair.privateKey.slice(1)
-        : keyPair.privateKey;
-
-    // Handle Base Key Parity
-    // If the public key has an ODD Y-coordinate (prefix 0x03), negate the private key
-    if (keyPair.publicKey[0] === 0x03) {
-      privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
-    }
-
-    // Apply Asset Tweak (if metadata exists - this is an Asset VTXO)
-    let assetPubkey: Buffer | undefined;
-    if (vtxo.metadata) {
-      const assetTweak = getAssetHash(vtxo.metadata);
-      const assetPrivateKey = ecc.privateAdd(privateKeyBuffer, assetTweak);
-      if (!assetPrivateKey) {
-        throw new Error('Asset tweak failed');
-      }
-      privateKeyBuffer = Buffer.from(assetPrivateKey);
-
-      // Handle Asset Pubkey Parity
-      // Get the intermediate pubkey (P') to check parity
-      const tempPair = ECPair.fromPrivateKey(privateKeyBuffer);
-      assetPubkey = tempPair.publicKey;
-
-      // If assetPubkey has odd Y-coordinate, negate the private key
-      if (assetPubkey[0] === 0x03) {
-        privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
-        // Recreate pair with negated key to get updated pubkey
-        const negatedPair = ECPair.fromPrivateKey(privateKeyBuffer);
-        assetPubkey = negatedPair.publicKey;
-      }
-    }
-
-    // Apply BIP-86 TapTweak (Standard for P2TR)
-    // Use assetPubkey if available (from asset tweak), otherwise get from base key
-    let pPrime: Buffer;
-    if (assetPubkey) {
-      pPrime = assetPubkey.slice(1, 33);
-    } else {
-      // No asset tweak, use the base key's x-only pubkey
-      const basePair = ECPair.fromPrivateKey(privateKeyBuffer);
-      pPrime = basePair.publicKey.slice(1, 33);
-    }
-
-    // Calculate TapTweak
-    const tapTweak = bitcoin.crypto.taggedHash('TapTweak', pPrime);
-    const finalPrivateKey = ecc.privateAdd(privateKeyBuffer, tapTweak);
-    if (!finalPrivateKey) {
-      throw new Error('Taproot tweak failed');
-    }
-
-    // Sign the hash
-    const signatureRaw = ecc.signSchnorr(txHashBuffer, finalPrivateKey);
-    return Buffer.from(signatureRaw).toString('hex');
+    return this.coreSign(txHashBuffer, options);
   }
 
   /**
@@ -792,7 +774,7 @@ export class MockArkClient {
     parent1Id: string,
     parent2Id: string,
   ): Promise<{ message: string; signature: string }> {
-    const { bitcoin, ecc } = walletTools;
+    const { bitcoin } = walletTools;
 
     // Step 1: Construct message
     const message = `Breed ${parent1Id} + ${parent2Id}`;
@@ -800,27 +782,10 @@ export class MockArkClient {
     // Step 2: Hash message (SHA256)
     const messageHash = bitcoin.crypto.sha256(Buffer.from(message, 'utf8'));
 
-    // Step 3: Get keypair and prepare private key
-    const keyPair = await this.getKeyPair();
-    if (!keyPair.privateKey) {
-      throw new Error('Missing private key');
-    }
-
-    // Prepare private key buffer (32 bytes)
-    let privateKeyBuffer =
-      keyPair.privateKey.length === 33
-        ? keyPair.privateKey.slice(1)
-        : keyPair.privateKey;
-
-    // Step 4: Handle Parity Check
-    // If the public key has an ODD Y-coordinate (prefix 0x03), negate the private key
-    if (keyPair.publicKey[0] === 0x03) {
-      privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
-    }
-
-    // Step 5: Sign hash with private key (no tweaking - base wallet key only)
-    const signatureRaw = ecc.signSchnorr(messageHash, privateKeyBuffer);
-    const signature = Buffer.from(signatureRaw).toString('hex');
+    // Step 3: Sign using unified logic with 'none' tweak behavior (raw key signing)
+    const signature = await this.coreSign(messageHash, {
+      tweakBehavior: 'none',
+    });
 
     return { message, signature };
   }
@@ -953,9 +918,9 @@ export class MockArkClient {
     return text
       ? JSON.parse(text)
       : {
-          total: 0,
-          distribution: { common: 0, rare: 0, epic: 0, legendary: 0 },
-        };
+        total: 0,
+        distribution: { common: 0, rare: 0, epic: 0, legendary: 0 },
+      };
   }
 
   /**
@@ -1009,7 +974,7 @@ export class MockArkClient {
   async signPondEntry(
     txid: TxId,
   ): Promise<{ message: string; signature: string }> {
-    const { bitcoin, ECPair, ecc } = walletTools;
+    const { bitcoin } = walletTools;
     const vtxos = this.getStorage();
 
     // Step 1: Find VTXO across all addresses
@@ -1029,72 +994,19 @@ export class MockArkClient {
     const message = `Showcase ${txid}`;
     const messageHash = bitcoin.crypto.sha256(Buffer.from(message, 'utf8'));
 
-    // Step 3: Get keypair and prepare private key
-    const keyPair = await this.getKeyPair();
-    if (!keyPair.privateKey) {
-      throw new Error('Missing private key');
-    }
+    // Step 3: Sign using unified logic
+    // Koi entries are assets, so we use 'asset' tweak behavior if metadata is present
+    // If no metadata (standard VTXO), we fallback to standard BIP86 (though Pond usually implies assets)
+    const options: SignOptions = vtxo.metadata
+      ? { tweakBehavior: 'asset', metadata: vtxo.metadata }
+      : { tweakBehavior: 'bip86' };
 
-    // Prepare private key buffer (32 bytes)
-    let privateKeyBuffer =
-      keyPair.privateKey.length === 33
-        ? keyPair.privateKey.slice(1)
-        : keyPair.privateKey;
-
-    // Step 4: Handle Base Key Parity
-    // If the public key has an ODD Y-coordinate (prefix 0x03), negate the private key
-    if (keyPair.publicKey[0] === 0x03) {
-      privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
-    }
-
-    // Step 5: Apply Asset Tweak (if metadata exists)
-    let assetPubkey: Buffer | undefined;
-    if (vtxo.metadata) {
-      const assetTweak = getAssetHash(vtxo.metadata);
-      const assetPrivateKey = ecc.privateAdd(privateKeyBuffer, assetTweak);
-      if (!assetPrivateKey) {
-        throw new Error('Asset tweak failed');
-      }
-      privateKeyBuffer = Buffer.from(assetPrivateKey);
-
-      // Step 6: Handle Asset Pubkey Parity
-      // Get the intermediate pubkey (P') to check parity
-      const tempPair = ECPair.fromPrivateKey(privateKeyBuffer);
-      assetPubkey = tempPair.publicKey;
-
-      // If assetPubkey has odd Y-coordinate, negate the private key
-      if (assetPubkey[0] === 0x03) {
-        privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
-        // Recreate pair with negated key to get updated pubkey
-        const negatedPair = ECPair.fromPrivateKey(privateKeyBuffer);
-        assetPubkey = negatedPair.publicKey;
-      }
-    }
-
-    // Step 7: Apply BIP-86 TapTweak (Standard for P2TR)
-    // Use assetPubkey if available (from asset tweak), otherwise get from base key
-    let pPrime: Buffer;
-    if (assetPubkey) {
-      pPrime = assetPubkey.slice(1, 33);
-    } else {
-      // No asset tweak, use the base key's x-only pubkey
-      const basePair = ECPair.fromPrivateKey(privateKeyBuffer);
-      pPrime = basePair.publicKey.slice(1, 33);
-    }
-
-    // Calculate TapTweak
-    const tapTweak = bitcoin.crypto.taggedHash('TapTweak', pPrime);
-    const finalPrivateKey = ecc.privateAdd(privateKeyBuffer, tapTweak);
-    if (!finalPrivateKey) {
-      throw new Error('Taproot tweak failed');
-    }
-
-    // Step 8: Sign the hash
-    const signatureRaw = ecc.signSchnorr(messageHash, finalPrivateKey);
-    const signature = Buffer.from(signatureRaw).toString('hex');
+    const signature = await this.coreSign(messageHash, options);
 
     return { message, signature };
   }
+
+
 
   /**
    * Enters a VTXO into the Pond by signing a proof of ownership
@@ -1132,7 +1044,7 @@ export class MockArkClient {
   async signFeedMessage(
     txid: TxId,
   ): Promise<{ message: string; signature: string }> {
-    const { bitcoin, ECPair, ecc } = walletTools;
+    const { bitcoin } = walletTools;
     const vtxos = this.getStorage();
 
     // Step 1: Find VTXO across all addresses
@@ -1148,73 +1060,16 @@ export class MockArkClient {
       throw new Error('VTXO not found');
     }
 
-    // Step 2: Create message and hash (different message format for feeding)
+    // Step 2: Create message and hash
     const message = `Feed ${txid}`;
     const messageHash = bitcoin.crypto.sha256(Buffer.from(message, 'utf8'));
 
-    // Step 3: Get keypair and prepare private key
-    const keyPair = await this.getKeyPair();
-    if (!keyPair.privateKey) {
-      throw new Error('Missing private key');
-    }
+    // Step 3: Sign using unified logic
+    const options: SignOptions = vtxo.metadata
+      ? { tweakBehavior: 'asset', metadata: vtxo.metadata }
+      : { tweakBehavior: 'bip86' };
 
-    // Prepare private key buffer (32 bytes)
-    let privateKeyBuffer =
-      keyPair.privateKey.length === 33
-        ? keyPair.privateKey.slice(1)
-        : keyPair.privateKey;
-
-    // Step 4: Handle Base Key Parity
-    // If the public key has an ODD Y-coordinate (prefix 0x03), negate the private key
-    if (keyPair.publicKey[0] === 0x03) {
-      privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
-    }
-
-    // Step 5: Apply Asset Tweak (if metadata exists)
-    let assetPubkey: Buffer | undefined;
-    if (vtxo.metadata) {
-      const assetTweak = getAssetHash(vtxo.metadata);
-      const assetPrivateKey = ecc.privateAdd(privateKeyBuffer, assetTweak);
-      if (!assetPrivateKey) {
-        throw new Error('Asset tweak failed');
-      }
-      privateKeyBuffer = Buffer.from(assetPrivateKey);
-
-      // Step 6: Handle Asset Pubkey Parity
-      // Get the intermediate pubkey (P') to check parity
-      const tempPair = ECPair.fromPrivateKey(privateKeyBuffer);
-      assetPubkey = tempPair.publicKey;
-
-      // If assetPubkey has odd Y-coordinate, negate the private key
-      if (assetPubkey[0] === 0x03) {
-        privateKeyBuffer = Buffer.from(ecc.privateNegate(privateKeyBuffer));
-        // Recreate pair with negated key to get updated pubkey
-        const negatedPair = ECPair.fromPrivateKey(privateKeyBuffer);
-        assetPubkey = negatedPair.publicKey;
-      }
-    }
-
-    // Step 7: Apply BIP-86 TapTweak (Standard for P2TR)
-    // Use assetPubkey if available (from asset tweak), otherwise get from base key
-    let pPrime: Buffer;
-    if (assetPubkey) {
-      pPrime = assetPubkey.slice(1, 33);
-    } else {
-      // No asset tweak, use the base key's x-only pubkey
-      const basePair = ECPair.fromPrivateKey(privateKeyBuffer);
-      pPrime = basePair.publicKey.slice(1, 33);
-    }
-
-    // Calculate TapTweak
-    const tapTweak = bitcoin.crypto.taggedHash('TapTweak', pPrime);
-    const finalPrivateKey = ecc.privateAdd(privateKeyBuffer, tapTweak);
-    if (!finalPrivateKey) {
-      throw new Error('Taproot tweak failed');
-    }
-
-    // Step 8: Sign the hash
-    const signatureRaw = ecc.signSchnorr(messageHash, finalPrivateKey);
-    const signature = Buffer.from(signatureRaw).toString('hex');
+    const signature = await this.coreSign(messageHash, options);
 
     return { message, signature };
   }
